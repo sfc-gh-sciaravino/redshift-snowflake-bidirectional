@@ -96,6 +96,10 @@ S3: redshift-to-snowflake/shipments/<YYYY-MM-DD-HH24MISS>/
     ▼
 Snowflake: shipments_staging
     │
+    │  WHEN SYSTEM$STREAM_HAS_DATA() (hourly cron)
+    ▼
+merge_shipments_task
+    │
     │  MERGE with ROW_NUMBER() dedup
     ▼
 Snowflake: shipments (target)
@@ -289,15 +293,32 @@ FILE_FORMAT = (TYPE = PARQUET)
 MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE;
 ```
 
-#### Incremental MERGE (run after each Snowpipe batch)
+#### Stream (on staging table)
 
 ```sql
+CREATE OR REPLACE STREAM <your-snowflake-database>.<your-snowflake-schema>.shipments_staging_stream
+  ON TABLE <your-snowflake-database>.<your-snowflake-schema>.shipments_staging
+  APPEND_ONLY = TRUE;
+```
+
+`APPEND_ONLY = TRUE` because Snowpipe only ever inserts into staging — no updates or deletes.
+The stream tracks exactly which rows Snowpipe has added since the last task run.
+
+#### Automated MERGE task
+
+```sql
+CREATE OR REPLACE TASK <your-snowflake-database>.<your-snowflake-schema>.merge_shipments_task
+  WAREHOUSE = <your-snowflake-warehouse>
+  SCHEDULE  = 'USING CRON 0 * * * * UTC'   -- hourly; adjust for production
+WHEN
+  SYSTEM$STREAM_HAS_DATA('<your-snowflake-database>.<your-snowflake-schema>.shipments_staging_stream')
+AS
 MERGE INTO <your-snowflake-database>.<your-snowflake-schema>.shipments AS tgt
 USING (
     SELECT * FROM (
         SELECT *,
                ROW_NUMBER() OVER (PARTITION BY shipment_id ORDER BY updated_at DESC) AS rn
-        FROM <your-snowflake-database>.<your-snowflake-schema>.shipments_staging
+        FROM <your-snowflake-database>.<your-snowflake-schema>.shipments_staging_stream
     ) WHERE rn = 1
 ) AS src
 ON tgt.shipment_id = src.shipment_id
@@ -313,11 +334,22 @@ VALUES
     (src.shipment_id, src.order_id, src.supplier_id, src.origin_warehouse, src.destination,
      src.carrier, src.status, src.ship_date, src.estimated_arrival, src.actual_arrival,
      src.quantity, src.weight_kg, src.updated_at);
+
+-- Tasks are suspended by default after creation — resume before use
+ALTER TASK <your-snowflake-database>.<your-snowflake-schema>.merge_shipments_task RESUME;
+
+-- Manually trigger for testing (bypasses the schedule)
+EXECUTE TASK <your-snowflake-database>.<your-snowflake-schema>.merge_shipments_task;
 ```
 
-> `ROW_NUMBER()` deduplication is required because Snowpipe may ingest the same row
-> multiple times if incremental windows overlap. Without it, Snowflake throws
-> "Duplicate row detected during DML action".
+> **How this works end-to-end:** Snowpipe writes new rows to `shipments_staging` →
+> the stream captures those inserts → the task fires (at most hourly) when
+> `SYSTEM$STREAM_HAS_DATA()` is true → MERGE upserts the delta into the target →
+> stream offset advances so those rows are never reprocessed.
+>
+> `ROW_NUMBER()` deduplication handles the case where Snowpipe ingests the same
+> row more than once (e.g., from overlapping incremental windows). Without it,
+> Snowflake throws "Duplicate row detected during DML action".
 >
 > **Adapting this MERGE for your table:** Two things need to change:
 > 1. Replace `shipment_id` in `PARTITION BY` and the `ON` clause with your table's primary key column
@@ -589,13 +621,20 @@ WHERE inventory_forecast.forecast_id = s.forecast_id
   AND s.metadata_action = 'DELETE';
 
 -- Step 3: Insert new and updated rows into target
--- (business columns only — metadata columns stay in staging, not in target)
-INSERT INTO inventory_forecast
-    (forecast_id, sku_id, product_name, warehouse_id, forecast_date,
-     forecasted_qty, actual_qty, confidence_score, model_version, updated_at)
+-- NOTE: We carry the three metadata columns through to the target here for
+-- transparency and debugging. In a production deployment you would typically
+-- strip them and keep the target to business columns only — remove
+-- metadata_action, metadata_isupdate, metadata_row_id from both the INSERT
+-- column list and the SELECT below, and drop those columns from the target table.
+INSERT INTO inventory_forecast (
+    forecast_id, sku_id, product_name, warehouse_id, forecast_date,
+    forecasted_qty, actual_qty, confidence_score, model_version, updated_at,
+    metadata_action, metadata_isupdate, metadata_row_id
+)
 SELECT
     forecast_id, sku_id, product_name, warehouse_id, forecast_date,
-    forecasted_qty, actual_qty, confidence_score, model_version, updated_at
+    forecasted_qty, actual_qty, confidence_score, model_version, updated_at,
+    metadata_action, metadata_isupdate, metadata_row_id
 FROM inventory_forecast_staging
 WHERE metadata_action = 'INSERT';
 ```
@@ -605,12 +644,69 @@ WHERE metadata_action = 'INSERT';
 > and an `INSERT` with the new values. Processing all DELETEs then all INSERTs applies
 > updates correctly without needing a SQL UPDATE statement.
 >
-> **Scheduling:** Run this COPY + apply block on the same cadence as the Snowflake task
-> (or shortly after) using a Redshift stored procedure scheduled via Query Editor v2 or
-> EventBridge Scheduler. If the Snowflake task skipped that week (no new data), the S3
-> file is unchanged and re-processing it is harmless — DELETE finds no matching rows to
-> remove and INSERT re-applies rows that already exist, which can be guarded with a
-> `WHERE NOT EXISTS` check if needed.
+> **Scheduling:** Wrap the COPY + apply block in the `copy_inventory_forecast()` stored
+> procedure below and schedule it via EventBridge Scheduler. The Snowflake task fires at
+> `:00` UTC each hour; schedule the Redshift procedure at `:30` to guarantee the Parquet
+> file has been written before the COPY starts.
+
+#### Stored procedure — COPY + apply CDC
+
+```sql
+CREATE OR REPLACE PROCEDURE copy_inventory_forecast()
+AS $$
+BEGIN
+    TRUNCATE TABLE <your-redshift-schema>.inventory_forecast_staging;
+
+    EXECUTE 'COPY <your-redshift-schema>.inventory_forecast_staging
+    FROM ''s3://<your-s3-bucket>/snowflake-to-redshift/inventory_forecast/''
+    IAM_ROLE ''arn:aws:iam::<your-aws-account-id>:role/<your-redshift-s3-role>''
+    FORMAT AS PARQUET';
+
+    DELETE FROM <your-redshift-schema>.inventory_forecast
+    USING <your-redshift-schema>.inventory_forecast_staging AS s
+    WHERE inventory_forecast.forecast_id = s.forecast_id
+      AND s.metadata_action IN ('DELETE', 'UPDATE_PRE');
+
+    INSERT INTO <your-redshift-schema>.inventory_forecast (
+        forecast_id, sku_id, product_name, warehouse_id,
+        forecast_date, forecasted_qty, actual_qty, confidence_score,
+        model_version, updated_at,
+        metadata_action, metadata_isupdate, metadata_row_id
+    )
+    SELECT
+        forecast_id, sku_id, product_name, warehouse_id,
+        forecast_date, forecasted_qty, actual_qty, confidence_score,
+        model_version, updated_at,
+        metadata_action, metadata_isupdate, metadata_row_id
+    FROM <your-redshift-schema>.inventory_forecast_staging
+    WHERE metadata_action IN ('INSERT', 'UPDATE_POST');
+END;
+$$ LANGUAGE plpgsql;
+```
+
+#### EventBridge Scheduler — automate the COPY
+
+Create an EventBridge Scheduler schedule that calls the procedure via the Redshift Data API.
+The Snowflake task runs at `:00` UTC; schedule this at `:30` to give the task time to finish.
+
+```bash
+aws scheduler create-schedule \
+  --name "<your-scheduler-name>" \
+  --schedule-expression "cron(30 * * * ? *)" \
+  --schedule-expression-timezone "UTC" \
+  --flexible-time-window '{"Mode": "OFF"}' \
+  --target '{
+    "Arn": "arn:aws:scheduler:::aws-sdk:redshiftdata:executeStatement",
+    "RoleArn": "arn:aws:iam::<your-aws-account-id>:role/<your-eventbridge-role>",
+    "Input": "{\"ClusterIdentifier\":\"<your-redshift-cluster>\",\"Database\":\"<your-redshift-database>\",\"DbUser\":\"<your-db-user>\",\"Sql\":\"CALL copy_inventory_forecast();\",\"StatementName\":\"eventbridge-copy-inventory-forecast\"}"
+  }' \
+  --region <your-aws-region>
+```
+
+> **Why `arn:aws:scheduler:::aws-sdk:redshiftdata:executeStatement`?**
+> EventBridge Scheduler uses AWS SDK universal targets (not `RedshiftDataParameters`).
+> The ARN prefix `arn:aws:scheduler:::aws-sdk:` maps directly to the AWS SDK service
+> and operation you want to invoke.
 
 ---
 
@@ -843,27 +939,37 @@ Follow this order for a clean first deployment.
 10. Create `etl_watermarks` and insert the `shipments` row
 11. Create `shipments` source table
 12. Create `inventory_forecast` target table — **include all three metadata columns**
-13. Create `export_shipments_incremental()` stored procedure
+13. Create `inventory_forecast_staging` table (same schema as target)
+14. Create `copy_inventory_forecast()` stored procedure
+15. Create `export_shipments_incremental()` stored procedure
+
+### AWS Automation Setup (one-time)
+
+16. Create IAM role `<your-eventbridge-role>` with trust: `scheduler.amazonaws.com` (include `aws:SourceAccount` condition) and permissions: `redshift-data:ExecuteStatement`, `redshift:GetClusterCredentials`
+17. Create EventBridge schedule for RS→SF export: `CALL export_shipments_incremental()` on your cadence
+18. Create EventBridge schedule for SF→RS COPY: `CALL copy_inventory_forecast()` at `:30` UTC hourly
 
 ### Snowflake Schema Setup (one-time)
 
-14. Create `shipments` target table and `shipments_staging` table
-15. Create `inventory_forecast` source table
-16. Create `inventory_forecast_stream` on the source table
-17. Create and resume `export_inventory_forecast_task`
+19. Create `shipments` target table and `shipments_staging` table
+20. Create `shipments_staging_stream` on the staging table
+21. Create and resume `merge_shipments_task`
+22. Create `inventory_forecast` source table
+23. Create `inventory_forecast_stream` on the source table
+24. Create and resume `export_inventory_forecast_task`
 
 ### Phase 1: Bulk Load (run once)
 
-18. Redshift: UNLOAD full `shipments` table to the `_bulk/` S3 prefix
-19. Snowflake: COPY bulk file into `shipments` target table
-20. Snowflake: Insert seed data into `inventory_forecast` → `EXECUTE TASK` manually
-21. Redshift: COPY from `snowflake-to-redshift/inventory_forecast/`
-22. Reset the Redshift watermark: `UPDATE etl_watermarks SET last_exported_at = SYSDATE WHERE table_name = 'shipments'`
+25. Redshift: UNLOAD full `shipments` table to the `_bulk/` S3 prefix
+26. Snowflake: COPY bulk file into `shipments` target table
+27. Snowflake: Insert seed data into `inventory_forecast` → `EXECUTE TASK` manually
+28. Redshift: COPY from `snowflake-to-redshift/inventory_forecast/`
+29. Reset the Redshift watermark: `UPDATE etl_watermarks SET last_exported_at = SYSDATE WHERE table_name = 'shipments'`
 
-### Phase 2: Incremental (ongoing)
+### Phase 2: Incremental (ongoing — fully automated)
 
-23. Scheduler fires `CALL export_shipments_incremental()` on your configured cadence
-24. Snowpipe auto-ingests new Parquet files into `shipments_staging`
-25. Run MERGE after each Snowpipe batch to upsert staging into the target
-26. `inventory_forecast_stream` feeds `export_inventory_forecast_task` hourly
-27. After the task fires, run the Redshift COPY to pull the latest Parquet
+30. EventBridge schedule fires `CALL export_shipments_incremental()` on your configured cadence
+31. Snowpipe auto-ingests new Parquet files into `shipments_staging`
+32. `shipments_staging_stream` detects new rows → `merge_shipments_task` fires automatically (at most hourly) and MERGEs the delta into the target
+33. `inventory_forecast_stream` feeds `export_inventory_forecast_task` hourly; Snowflake task writes Parquet to S3 at `:00` UTC
+34. EventBridge schedule fires `CALL copy_inventory_forecast()` at `:30` UTC; procedure TRUNCATEs staging, COPYs Parquet, applies CDC (DELETE+INSERT) to target
