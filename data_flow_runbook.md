@@ -815,20 +815,6 @@ ORDER BY scheduled_time DESC LIMIT 5;
 
 ---
 
-## Known Issues & Solutions
-
-| Issue | Root Cause | Fix |
-|---|---|---|
-| Snowpipe skips file on second run | Snowpipe deduplicates by filename — same filename is never re-ingested | Write to timestamped S3 paths: `.../shipments/<YYYY-MM-DD-HH24MISS>/` |
-| MERGE fails: "Duplicate row detected" | Multiple staging rows with the same primary key | Wrap USING clause with `ROW_NUMBER() OVER (PARTITION BY shipment_id ORDER BY updated_at DESC)` |
-| Task COPY fails: "Files already exist" | Fixed S3 path without `OVERWRITE` set | Add `OVERWRITE = TRUE` to the task's COPY INTO |
-| Redshift COPY fails: column count mismatch | Snowflake stream exports 3 METADATA$ columns; Redshift target table is missing them | Include `metadata_action`, `metadata_isupdate`, `metadata_row_id` columns at table creation time |
-| Redshift COPY fails: incompatible Parquet schema | Snowflake `NUMBER` writes `decimal128(38,0)` in Parquet; incompatible with Redshift `BIGINT`/`INT` | Explicitly cast integer columns to `::BIGINT` in the task SELECT |
-| `METADATA$ACTION` column not found in Redshift | The `$` character is invalid in Redshift column names | Alias in task SELECT: `METADATA$ACTION AS metadata_action` |
-| EventBridge Scheduler fires 0 invocations | Missing `aws:SourceAccount` condition in the IAM trust policy | Add the condition to the trust policy; delete and recreate the schedule |
-
----
-
 ## Phase-by-Phase Setup Order
 
 Follow this order for a clean first deployment.
